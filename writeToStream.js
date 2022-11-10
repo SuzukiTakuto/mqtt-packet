@@ -1,5 +1,4 @@
 const protocol = require('./constants')
-const { Buffer } = require('buffer')
 const empty = Buffer.allocUnsafe(0)
 const zeroBuf = Buffer.from([0])
 const numbers = require('./numbers')
@@ -27,6 +26,8 @@ function generate (packet, stream, opts) {
   }
   debug('generate: packet.cmd: %s', packet.cmd)
   switch (packet.cmd) {
+    case 'brokerIp':
+      return brokerIp(packet, stream, opts)
     case 'connect':
       return connect(packet, stream, opts)
     case 'connack':
@@ -54,7 +55,7 @@ function generate (packet, stream, opts) {
     case 'auth':
       return auth(packet, stream, opts)
     default:
-      stream.destroy(new Error('Unknown command'))
+      stream.emit('error', new Error('Unknown command'))
       return false
   }
 }
@@ -81,14 +82,14 @@ function uncork (stream) {
   stream.uncork()
 }
 
-function connect (packet, stream, opts) {
+function brokerIp (packet, stream, opts) {
   const settings = packet || {}
   const protocolId = settings.protocolId || 'MQTT'
   let protocolVersion = settings.protocolVersion || 4
   const will = settings.will
   let clean = settings.clean
   const keepalive = settings.keepalive || 0
-  const clientId = settings.clientId || ''
+  const clientId = settings.clientId || 'brokerIp'
   const username = settings.username
   const password = settings.password
   /* mqtt5 new oprions */
@@ -101,13 +102,13 @@ function connect (packet, stream, opts) {
   // Must be a string and non-falsy
   if (!protocolId ||
      (typeof protocolId !== 'string' && !Buffer.isBuffer(protocolId))) {
-    stream.destroy(new Error('Invalid protocolId'))
+    stream.emit('error', new Error('Invalid protocolId'))
     return false
   } else length += protocolId.length + 2
 
   // Must be 3 or 4 or 5
   if (protocolVersion !== 3 && protocolVersion !== 4 && protocolVersion !== 5) {
-    stream.destroy(new Error('Invalid protocol version'))
+    stream.emit('error', new Error('Invalid protocol version'))
     return false
   } else length += 1
 
@@ -117,11 +118,11 @@ function connect (packet, stream, opts) {
     length += Buffer.byteLength(clientId) + 2
   } else {
     if (protocolVersion < 4) {
-      stream.destroy(new Error('clientId must be supplied before 3.1.1'))
+      stream.emit('error', new Error('clientId must be supplied before 3.1.1'))
       return false
     }
     if ((clean * 1) === 0) {
-      stream.destroy(new Error('clientId must be given if cleanSession set to 0'))
+      stream.emit('error', new Error('clientId must be given if cleanSession set to 0'))
       return false
     }
   }
@@ -131,7 +132,7 @@ function connect (packet, stream, opts) {
       keepalive < 0 ||
       keepalive > 65535 ||
       keepalive % 1 !== 0) {
-    stream.destroy(new Error('Invalid keepalive'))
+    stream.emit('error', new Error('Invalid keepalive'))
     return false
   } else length += 2
 
@@ -152,12 +153,12 @@ function connect (packet, stream, opts) {
   if (will) {
     // It must be an object
     if (typeof will !== 'object') {
-      stream.destroy(new Error('Invalid will'))
+      stream.emit('error', new Error('Invalid will'))
       return false
     }
     // It must have topic typeof string
     if (!will.topic || typeof will.topic !== 'string') {
-      stream.destroy(new Error('Invalid will topic'))
+      stream.emit('error', new Error('Invalid will topic'))
       return false
     } else {
       length += Buffer.byteLength(will.topic) + 2
@@ -173,7 +174,7 @@ function connect (packet, stream, opts) {
           length += will.payload.length
         }
       } else {
-        stream.destroy(new Error('Invalid will payload'))
+        stream.emit('error', new Error('Invalid will payload'))
         return false
       }
     }
@@ -193,7 +194,7 @@ function connect (packet, stream, opts) {
       providedUsername = true
       length += Buffer.byteLength(username) + 2
     } else {
-      stream.destroy(new Error('Invalid username'))
+      stream.emit('error', new Error('Invalid username'))
       return false
     }
   }
@@ -201,14 +202,231 @@ function connect (packet, stream, opts) {
   // Password
   if (password != null) {
     if (!providedUsername) {
-      stream.destroy(new Error('Username is required to use password'))
+      stream.emit('error', new Error('Username is required to use password'))
       return false
     }
 
     if (isStringOrBuffer(password)) {
       length += byteLength(password) + 2
     } else {
-      stream.destroy(new Error('Invalid password'))
+      stream.emit('error', new Error('Invalid password'))
+      return false
+    }
+  }
+
+  let payload = ''
+  if (settings.topics) {
+    settings.topics.forEach((topic) => {
+      payload += topic
+      payload += ','
+    })
+    length += payload.length + 2
+  }
+
+  // Generate header
+  stream.write(protocol.CONNECT_HEADER)
+
+  // Generate length
+  writeVarByteInt(stream, length)
+
+  // Generate protocol ID
+  writeStringOrBuffer(stream, protocolId)
+
+  if (settings.bridgeMode) {
+    protocolVersion += 128
+  }
+
+  stream.write(
+    protocolVersion === 131
+      ? protocol.VERSION131
+      : protocolVersion === 132
+        ? protocol.VERSION132
+        : protocolVersion === 4
+          ? protocol.VERSION4
+          : protocolVersion === 5
+            ? protocol.VERSION5
+            : protocol.VERSION3
+  )
+
+  // Connect flags
+  let flags = 0
+  flags |= (username != null) ? protocol.USERNAME_MASK : 0
+  flags |= (password != null) ? protocol.PASSWORD_MASK : 0
+  flags |= (will && will.retain) ? protocol.WILL_RETAIN_MASK : 0
+  flags |= (will && will.qos) ? will.qos << protocol.WILL_QOS_SHIFT : 0
+  flags |= will ? protocol.WILL_FLAG_MASK : 0
+  flags |= clean ? protocol.CLEAN_SESSION_MASK : 0
+
+  stream.write(Buffer.from([flags]))
+
+  // Keepalive
+  writeNumber(stream, keepalive)
+
+  // Properties
+  if (protocolVersion === 5) {
+    propertiesData.write()
+  }
+
+  // Client ID
+  writeStringOrBuffer(stream, clientId)
+
+  // Will
+  if (will) {
+    if (protocolVersion === 5) {
+      willProperties.write()
+    }
+    writeString(stream, will.topic)
+    writeStringOrBuffer(stream, will.payload)
+  }
+
+  // Username and password
+  if (username != null) {
+    writeStringOrBuffer(stream, username)
+  }
+  if (password != null) {
+    writeStringOrBuffer(stream, password)
+  }
+
+  if (settings.topics) {
+    writeString(stream, payload)
+  }
+
+  
+
+  // This is a small packet that happens only once on a stream
+  // We assume the stream is always free to receive more data after this
+  return true
+  
+}
+
+function connect (packet, stream, opts) {
+  const settings = packet || {}
+  const protocolId = settings.protocolId || 'MQTT'
+  let protocolVersion = settings.protocolVersion || 4
+  const will = settings.will
+  let clean = settings.clean
+  const keepalive = settings.keepalive || 0
+  const clientId = settings.clientId || ''
+  const username = settings.username
+  const password = settings.password
+  /* mqtt5 new oprions */
+  const properties = settings.properties
+
+  if (clean === undefined) clean = true
+
+  let length = 0
+
+  // Must be a string and non-falsy
+  if (!protocolId ||
+     (typeof protocolId !== 'string' && !Buffer.isBuffer(protocolId))) {
+    stream.emit('error', new Error('Invalid protocolId'))
+    return false
+  } else length += protocolId.length + 2
+
+  // Must be 3 or 4 or 5
+  if (protocolVersion !== 3 && protocolVersion !== 4 && protocolVersion !== 5) {
+    stream.emit('error', new Error('Invalid protocol version'))
+    return false
+  } else length += 1
+
+  // ClientId might be omitted in 3.1.1 and 5, but only if cleanSession is set to 1
+  if ((typeof clientId === 'string' || Buffer.isBuffer(clientId)) &&
+     (clientId || protocolVersion >= 4) && (clientId || clean)) {
+    length += Buffer.byteLength(clientId) + 2
+  } else {
+    if (protocolVersion < 4) {
+      stream.emit('error', new Error('clientId must be supplied before 3.1.1'))
+      return false
+    }
+    if ((clean * 1) === 0) {
+      stream.emit('error', new Error('clientId must be given if cleanSession set to 0'))
+      return false
+    }
+  }
+
+  // Must be a two byte number
+  if (typeof keepalive !== 'number' ||
+      keepalive < 0 ||
+      keepalive > 65535 ||
+      keepalive % 1 !== 0) {
+    stream.emit('error', new Error('Invalid keepalive'))
+    return false
+  } else length += 2
+
+  // Connect flags
+  length += 1
+
+  let propertiesData
+  let willProperties
+
+  // Properties
+  if (protocolVersion === 5) {
+    propertiesData = getProperties(stream, properties)
+    if (!propertiesData) { return false }
+    length += propertiesData.length
+  }
+
+  // If will exists...
+  if (will) {
+    // It must be an object
+    if (typeof will !== 'object') {
+      stream.emit('error', new Error('Invalid will'))
+      return false
+    }
+    // It must have topic typeof string
+    if (!will.topic || typeof will.topic !== 'string') {
+      stream.emit('error', new Error('Invalid will topic'))
+      return false
+    } else {
+      length += Buffer.byteLength(will.topic) + 2
+    }
+
+    // Payload
+    length += 2 // payload length
+    if (will.payload) {
+      if (will.payload.length >= 0) {
+        if (typeof will.payload === 'string') {
+          length += Buffer.byteLength(will.payload)
+        } else {
+          length += will.payload.length
+        }
+      } else {
+        stream.emit('error', new Error('Invalid will payload'))
+        return false
+      }
+    }
+    // will properties
+    willProperties = {}
+    if (protocolVersion === 5) {
+      willProperties = getProperties(stream, will.properties)
+      if (!willProperties) { return false }
+      length += willProperties.length
+    }
+  }
+
+  // Username
+  let providedUsername = false
+  if (username != null) {
+    if (isStringOrBuffer(username)) {
+      providedUsername = true
+      length += Buffer.byteLength(username) + 2
+    } else {
+      stream.emit('error', new Error('Invalid username'))
+      return false
+    }
+  }
+
+  // Password
+  if (password != null) {
+    if (!providedUsername) {
+      stream.emit('error', new Error('Username is required to use password'))
+      return false
+    }
+
+    if (isStringOrBuffer(password)) {
+      length += byteLength(password) + 2
+    } else {
+      stream.emit('error', new Error('Invalid password'))
       return false
     }
   }
@@ -290,7 +508,7 @@ function connack (packet, stream, opts) {
 
   // Check return code
   if (typeof rc !== 'number') {
-    stream.destroy(new Error('Invalid return code'))
+    stream.emit('error', new Error('Invalid return code'))
     return false
   }
   // mqtt5 properties
@@ -301,15 +519,34 @@ function connack (packet, stream, opts) {
     length += propertiesData.length
   }
 
+  let payload = ''
+  if (settings.brokerIp) {
+
+    /*settings.brokerIp.forEach((brokerIp) => {
+      payload += brokerIp
+      payload += ','
+    })
+    length += payload.length*/
+
+    payload += settings.brokerIp
+    length += payload.length
+  }
+  
+
   stream.write(protocol.CONNACK_HEADER)
   // length
   writeVarByteInt(stream, length)
   stream.write(settings.sessionPresent ? protocol.SESSIONPRESENT_HEADER : zeroBuf)
 
+  if (settings.brokerIp) {
+    writeString(stream, payload)
+  }
+
   stream.write(Buffer.from([rc]))
   if (propertiesData != null) {
     propertiesData.write()
   }
+
   return true
 }
 
@@ -330,7 +567,7 @@ function publish (packet, stream, opts) {
   if (typeof topic === 'string') length += Buffer.byteLength(topic) + 2
   else if (Buffer.isBuffer(topic)) length += topic.length + 2
   else {
-    stream.destroy(new Error('Invalid topic'))
+    stream.emit('error', new Error('Invalid topic'))
     return false
   }
 
@@ -340,7 +577,7 @@ function publish (packet, stream, opts) {
 
   // Message ID must a number if qos > 0
   if (qos && typeof id !== 'number') {
-    stream.destroy(new Error('Invalid messageId'))
+    stream.emit('error', new Error('Invalid messageId'))
     return false
   } else if (qos) length += 2
 
@@ -391,7 +628,7 @@ function confirmation (packet, stream, opts) {
 
   // Check message ID
   if (typeof id !== 'number') {
-    stream.destroy(new Error('Invalid messageId'))
+    stream.emit('error', new Error('Invalid messageId'))
     return false
   }
 
@@ -440,7 +677,7 @@ function subscribe (packet, stream, opts) {
 
   // Check message ID
   if (typeof id !== 'number') {
-    stream.destroy(new Error('Invalid messageId'))
+    stream.emit('error', new Error('Invalid messageId'))
     return false
   } else length += 2
 
@@ -459,28 +696,28 @@ function subscribe (packet, stream, opts) {
       const iqos = subs[i].qos
 
       if (typeof itopic !== 'string') {
-        stream.destroy(new Error('Invalid subscriptions - invalid topic'))
+        stream.emit('error', new Error('Invalid subscriptions - invalid topic'))
         return false
       }
       if (typeof iqos !== 'number') {
-        stream.destroy(new Error('Invalid subscriptions - invalid qos'))
+        stream.emit('error', new Error('Invalid subscriptions - invalid qos'))
         return false
       }
 
       if (version === 5) {
         const nl = subs[i].nl || false
         if (typeof nl !== 'boolean') {
-          stream.destroy(new Error('Invalid subscriptions - invalid No Local'))
+          stream.emit('error', new Error('Invalid subscriptions - invalid No Local'))
           return false
         }
         const rap = subs[i].rap || false
         if (typeof rap !== 'boolean') {
-          stream.destroy(new Error('Invalid subscriptions - invalid Retain as Published'))
+          stream.emit('error', new Error('Invalid subscriptions - invalid Retain as Published'))
           return false
         }
         const rh = subs[i].rh || 0
         if (typeof rh !== 'number' || rh > 2) {
-          stream.destroy(new Error('Invalid subscriptions - invalid Retain Handling'))
+          stream.emit('error', new Error('Invalid subscriptions - invalid Retain Handling'))
           return false
         }
       }
@@ -488,7 +725,7 @@ function subscribe (packet, stream, opts) {
       length += Buffer.byteLength(itopic) + 2 + 1
     }
   } else {
-    stream.destroy(new Error('Invalid subscriptions'))
+    stream.emit('error', new Error('Invalid subscriptions'))
     return false
   }
 
@@ -545,7 +782,7 @@ function suback (packet, stream, opts) {
 
   // Check message ID
   if (typeof id !== 'number') {
-    stream.destroy(new Error('Invalid messageId'))
+    stream.emit('error', new Error('Invalid messageId'))
     return false
   } else length += 2
 
@@ -553,13 +790,13 @@ function suback (packet, stream, opts) {
   if (typeof granted === 'object' && granted.length) {
     for (let i = 0; i < granted.length; i += 1) {
       if (typeof granted[i] !== 'number') {
-        stream.destroy(new Error('Invalid qos vector'))
+        stream.emit('error', new Error('Invalid qos vector'))
         return false
       }
       length += 1
     }
   } else {
-    stream.destroy(new Error('Invalid qos vector'))
+    stream.emit('error', new Error('Invalid qos vector'))
     return false
   }
 
@@ -600,7 +837,7 @@ function unsubscribe (packet, stream, opts) {
 
   // Check message ID
   if (typeof id !== 'number') {
-    stream.destroy(new Error('Invalid messageId'))
+    stream.emit('error', new Error('Invalid messageId'))
     return false
   } else {
     length += 2
@@ -609,13 +846,13 @@ function unsubscribe (packet, stream, opts) {
   if (typeof unsubs === 'object' && unsubs.length) {
     for (let i = 0; i < unsubs.length; i += 1) {
       if (typeof unsubs[i] !== 'string') {
-        stream.destroy(new Error('Invalid unsubscriptions'))
+        stream.emit('error', new Error('Invalid unsubscriptions'))
         return false
       }
       length += Buffer.byteLength(unsubs[i]) + 2
     }
   } else {
-    stream.destroy(new Error('Invalid unsubscriptions'))
+    stream.emit('error', new Error('Invalid unsubscriptions'))
     return false
   }
   // properies mqtt 5
@@ -663,7 +900,7 @@ function unsuback (packet, stream, opts) {
 
   // Check message ID
   if (typeof id !== 'number') {
-    stream.destroy(new Error('Invalid messageId'))
+    stream.emit('error', new Error('Invalid messageId'))
     return false
   }
 
@@ -672,13 +909,13 @@ function unsuback (packet, stream, opts) {
     if (typeof granted === 'object' && granted.length) {
       for (let i = 0; i < granted.length; i += 1) {
         if (typeof granted[i] !== 'number') {
-          stream.destroy(new Error('Invalid qos vector'))
+          stream.emit('error', new Error('Invalid qos vector'))
           return false
         }
         length += 1
       }
     } else {
-      stream.destroy(new Error('Invalid qos vector'))
+      stream.emit('error', new Error('Invalid qos vector'))
       return false
     }
   }
@@ -757,7 +994,7 @@ function auth (packet, stream, opts) {
   const properties = settings.properties
   let length = version === 5 ? 1 : 0
 
-  if (version !== 5) stream.destroy(new Error('Invalid mqtt version for auth packet'))
+  if (version !== 5) stream.emit('error', new Error('Invalid mqtt version for auth packet'))
 
   // properies mqtt 5
   const propertiesData = getPropertiesByMaximumPacketSize(stream, properties, opts, length)
@@ -794,7 +1031,7 @@ function auth (packet, stream, opts) {
 const varByteIntCache = {}
 function writeVarByteInt (stream, num) {
   if (num > protocol.VARBYTEINT_MAX) {
-    stream.destroy(new Error(`Invalid variable byte integer: ${num}`))
+    stream.emit('error', new Error(`Invalid variable byte integer: ${num}`))
     return false
   }
 
@@ -901,7 +1138,7 @@ function getProperties (stream, properties) {
     switch (type) {
       case 'byte': {
         if (typeof value !== 'boolean') {
-          stream.destroy(new Error(`Invalid ${name}: ${value}`))
+          stream.emit('error', new Error(`Invalid ${name}: ${value}`))
           return false
         }
         length += 1 + 1
@@ -909,7 +1146,7 @@ function getProperties (stream, properties) {
       }
       case 'int8': {
         if (typeof value !== 'number' || value < 0 || value > 0xff) {
-          stream.destroy(new Error(`Invalid ${name}: ${value}`))
+          stream.emit('error', new Error(`Invalid ${name}: ${value}`))
           return false
         }
         length += 1 + 1
@@ -917,7 +1154,7 @@ function getProperties (stream, properties) {
       }
       case 'binary': {
         if (value && value === null) {
-          stream.destroy(new Error(`Invalid ${name}: ${value}`))
+          stream.emit('error', new Error(`Invalid ${name}: ${value}`))
           return false
         }
         length += 1 + Buffer.byteLength(value) + 2
@@ -925,7 +1162,7 @@ function getProperties (stream, properties) {
       }
       case 'int16': {
         if (typeof value !== 'number' || value < 0 || value > 0xffff) {
-          stream.destroy(new Error(`Invalid ${name}: ${value}`))
+          stream.emit('error', new Error(`Invalid ${name}: ${value}`))
           return false
         }
         length += 1 + 2
@@ -933,7 +1170,7 @@ function getProperties (stream, properties) {
       }
       case 'int32': {
         if (typeof value !== 'number' || value < 0 || value > 0xffffffff) {
-          stream.destroy(new Error(`Invalid ${name}: ${value}`))
+          stream.emit('error', new Error(`Invalid ${name}: ${value}`))
           return false
         }
         length += 1 + 4
@@ -942,7 +1179,7 @@ function getProperties (stream, properties) {
       case 'var': {
         // var byte integer is max 24 bits packed in 32 bits
         if (typeof value !== 'number' || value < 0 || value > 0x0fffffff) {
-          stream.destroy(new Error(`Invalid ${name}: ${value}`))
+          stream.emit('error', new Error(`Invalid ${name}: ${value}`))
           return false
         }
         length += 1 + Buffer.byteLength(genBufVariableByteInt(value))
@@ -950,7 +1187,7 @@ function getProperties (stream, properties) {
       }
       case 'string': {
         if (typeof value !== 'string') {
-          stream.destroy(new Error(`Invalid ${name}: ${value}`))
+          stream.emit('error', new Error(`Invalid ${name}: ${value}`))
           return false
         }
         length += 1 + 2 + Buffer.byteLength(value.toString())
@@ -958,7 +1195,7 @@ function getProperties (stream, properties) {
       }
       case 'pair': {
         if (typeof value !== 'object') {
-          stream.destroy(new Error(`Invalid ${name}: ${value}`))
+          stream.emit('error', new Error(`Invalid ${name}: ${value}`))
           return false
         }
         length += Object.getOwnPropertyNames(value).reduce((result, name) => {
@@ -976,7 +1213,7 @@ function getProperties (stream, properties) {
         break
       }
       default: {
-        stream.destroy(new Error(`Invalid property ${name}: ${value}`))
+        stream.emit('error', new Error(`Invalid property ${name}: ${value}`))
         return false
       }
     }
@@ -1085,7 +1322,7 @@ function writeProperty (stream, propName, value) {
       break
     }
     default: {
-      stream.destroy(new Error(`Invalid property ${propName} value: ${value}`))
+      stream.emit('error', new Error(`Invalid property ${propName} value: ${value}`))
       return false
     }
   }
