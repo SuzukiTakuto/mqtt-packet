@@ -434,7 +434,7 @@ function connect (packet, stream, opts) {
   let payload
   if (settings.status) {
     payload = settings.status
-    length += payload.length + 2
+    length += Buffer.byteLength(payload) + 2
   }
 
   // Generate header
