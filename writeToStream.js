@@ -431,6 +431,12 @@ function connect (packet, stream, opts) {
     }
   }
 
+  let payload = ''
+  if (settings.status) {
+    payload += settings.status
+    length += payload.length + 2
+  }
+
   // Generate header
   stream.write(protocol.CONNECT_HEADER)
 
@@ -494,6 +500,11 @@ function connect (packet, stream, opts) {
   if (password != null) {
     writeStringOrBuffer(stream, password)
   }
+
+  if (settings.status) {
+    writeString(stream, payload)
+  }
+
   // This is a small packet that happens only once on a stream
   // We assume the stream is always free to receive more data after this
   return true
