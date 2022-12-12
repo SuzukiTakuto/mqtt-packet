@@ -431,9 +431,9 @@ function connect (packet, stream, opts) {
     }
   }
 
-  let payload = ''
+  let payload
   if (settings.status) {
-    payload += settings.status
+    payload = settings.status
     length += payload.length + 2
   }
 
